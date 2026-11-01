@@ -1,0 +1,30 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Virtual Environment
+.venv/
+env/
+venv/
+
+# Antigravity & OS files
+.DS_Store
+Thumbs.db
+*.log
+config.json
+
+# Android build outputs & local config
+android-app/.gradle/
+android-app/build/
+android-app/*/build/
+android-app/local.properties
+android-app/*.iml
+android-app/.idea/
+android-app/captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+!pc-companion/dist/agy-pocket.apk
