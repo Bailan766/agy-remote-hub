@@ -13,6 +13,7 @@ import ctypes
 import secrets
 import io
 import asyncio
+from copy import deepcopy
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
@@ -24,9 +25,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import qrcode
 import pyperclip
-from pynput.mouse import Controller as MouseController, Button as MouseButton
-from pynput.keyboard import Controller as KeyboardController, Key
 import mss
+
+try:
+    from pynput.mouse import Controller as MouseController, Button as MouseButton
+    from pynput.keyboard import Controller as KeyboardController, Key
+except Exception:
+    MouseController = None
+    MouseButton = None
+    KeyboardController = None
+    Key = None
+
+from quota_monitor import get_antigravity_quota
+from agent_runner import AgentRunner
+from im_bridge import IMBridgeManager
 
 # Windows API for window management & Keep-Awake
 ES_CONTINUOUS = 0x80000000
@@ -52,21 +64,19 @@ DIST_DIR = BASE_DIR / "dist"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 DIST_DIR.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_BRAIN_DIR = Path(os.environ.get("USERPROFILE", "C:\\Users\\Administrator")) / ".gemini" / "antigravity" / "brain"
+DEFAULT_BRAIN_DIR = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".gemini" / "antigravity" / "brain"
 CONFIG_FILE = BASE_DIR / "config.json"
 
-def get_or_create_config() -> dict:
-    if CONFIG_FILE.exists():
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    # Generate persistent auth token
-    default_cfg = {
+
+def _default_config() -> dict:
+    return {
         "token": secrets.token_urlsafe(16),
         "port": 8765,
         "keep_awake": True,
+        "workspace_dir": str(Path.home()),
+        "agy_mode": "auto",
+        "agy_model": "",
+        "agy_path": "",
         "custom_shortcuts": [
             {"id": "plan", "label": "📐 /plan", "text": "/plan "},
             {"id": "goal", "label": "🎯 /goal", "text": "/goal "},
@@ -74,11 +84,61 @@ def get_or_create_config() -> dict:
             {"id": "boost", "label": "⚡ /boost", "text": "/boost "},
             {"id": "proceed", "label": "✅ Proceed / 同意", "text": "Proceed"},
             {"id": "yes", "label": "👍 确认执行", "text": "好，开始执行"}
-        ]
+        ],
+        "im_bridge": {
+            "enabled": False,
+            "fallback_to_desktop": True,
+            "telegram": {
+                "enabled": False,
+                "bot_token": "",
+                "proxy_url": "",
+                "allowed_user_ids": []
+            },
+            "feishu": {
+                "enabled": False,
+                "app_id": "",
+                "app_secret": "",
+                "allowed_open_ids": []
+            },
+            "qq": {
+                "enabled": False,
+                "ws_url": "ws://127.0.0.1:3001",
+                "access_token": "",
+                "allowed_qq": []
+            }
+        }
     }
+
+
+def _merge_defaults(target: dict, defaults: dict) -> dict:
+    merged = deepcopy(defaults)
+    for k, v in target.items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = _merge_defaults(v, merged[k])
+        else:
+            merged[k] = v
+    return merged
+
+
+def save_config(cfg: dict) -> None:
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(default_cfg, f, indent=2, ensure_ascii=False)
-    return default_cfg
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+
+def get_or_create_config() -> dict:
+    defaults = _default_config()
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            merged = _merge_defaults(loaded, defaults)
+            if merged != loaded:
+                save_config(merged)
+            return merged
+        except Exception:
+            pass
+    save_config(defaults)
+    return defaults
 
 CONFIG = get_or_create_config()
 AUTH_TOKEN = CONFIG.get("token", "agypocket_default")
@@ -140,10 +200,10 @@ def find_and_focus_antigravity_window() -> bool:
     return False
 
 # Input controllers
-mouse = MouseController()
-keyboard = KeyboardController()
+mouse = MouseController() if MouseController else None
+keyboard = KeyboardController() if KeyboardController else None
 
-app = FastAPI(title="Antigravity Pocket Hub", version="1.0.0")
+app = FastAPI(title="Antigravity Pocket Hub", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -166,6 +226,10 @@ class PromptRequest(BaseModel):
     text: str
     auto_submit: bool = True
 
+class ChatRequest(BaseModel):
+    text: str
+    chat_key: str = "web:mobile"
+
 class QuickActionRequest(BaseModel):
     action: str
     param: Optional[str] = None
@@ -173,6 +237,151 @@ class QuickActionRequest(BaseModel):
 class TapRequest(BaseModel):
     x: float  # Normalized 0.0 - 1.0
     y: float  # Normalized 0.0 - 1.0
+
+class IMBridgeConfigRequest(BaseModel):
+    enabled: Optional[bool] = None
+    fallback_to_desktop: Optional[bool] = None
+    workspace_dir: Optional[str] = None
+    agy_mode: Optional[str] = None
+    agy_model: Optional[str] = None
+    telegram: Optional[Dict[str, Any]] = None
+    feishu: Optional[Dict[str, Any]] = None
+    qq: Optional[Dict[str, Any]] = None
+
+class ModelSelectRequest(BaseModel):
+    model: str = ""
+    chat_key: Optional[str] = None
+
+
+# ----------------- Core Helpers -----------------
+
+def collect_conversations_summary() -> List[Dict[str, Any]]:
+    if not DEFAULT_BRAIN_DIR.exists():
+        return []
+    results = []
+    conv_dirs = [d for d in DEFAULT_BRAIN_DIR.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    conv_dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+
+    for cdir in conv_dirs[:15]:
+        conv_id = cdir.name
+        transcript_path = cdir / ".system_generated" / "logs" / "transcript.jsonl"
+        last_user_msg = ""
+        last_step_status = "UNKNOWN"
+        last_time = cdir.stat().st_mtime
+
+        if transcript_path.exists():
+            try:
+                with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = [line.strip() for line in f if line.strip()]
+                for line in reversed(lines):
+                    try:
+                        data = json.loads(line)
+                        if not last_user_msg and data.get("type") == "USER_INPUT":
+                            last_user_msg = data.get("content", "")
+                        if last_step_status == "UNKNOWN" and "status" in data:
+                            last_step_status = data.get("status")
+                        if last_user_msg and last_step_status != "UNKNOWN":
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        artifacts = [f.name for f in cdir.glob("*.md")]
+        results.append({
+            "id": conv_id,
+            "title": (last_user_msg[:60] + "...") if len(last_user_msg) > 60 else (last_user_msg or conv_id),
+            "status": last_step_status,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_time)),
+            "artifact_count": len(artifacts),
+            "artifacts": artifacts
+        })
+    return results
+
+
+def inject_prompt_to_desktop(text: str, auto_submit: bool = True) -> Dict[str, Any]:
+    if not keyboard or not Key:
+        raise RuntimeError("Desktop keyboard controller is unavailable in this environment.")
+    find_and_focus_antigravity_window()
+    time.sleep(0.15)
+    pyperclip.copy(text)
+    with keyboard.pressed(Key.ctrl):
+        keyboard.press('v')
+        keyboard.release('v')
+    if auto_submit:
+        time.sleep(0.1)
+        keyboard.press(Key.enter)
+        keyboard.release(Key.enter)
+    return {"status": "success", "sent": text}
+
+
+def trigger_quick_action(action: str, param: Optional[str] = None) -> Dict[str, Any]:
+    act = action.lower()
+    if act == "keep_awake":
+        enabled = param.lower() in ("true", "1") if param else True
+        success = set_keep_awake(enabled)
+        return {"status": "ok", "keep_awake": enabled, "success": success}
+
+    if not keyboard or not Key:
+        raise RuntimeError("Desktop keyboard controller is unavailable in this environment.")
+
+    find_and_focus_antigravity_window()
+    time.sleep(0.1)
+
+    if act == "plan":
+        pyperclip.copy("/plan ")
+        with keyboard.pressed(Key.ctrl):
+            keyboard.press('v')
+            keyboard.release('v')
+    elif act == "goal":
+        pyperclip.copy("/goal ")
+        with keyboard.pressed(Key.ctrl):
+            keyboard.press('v')
+            keyboard.release('v')
+    elif act == "compact":
+        pyperclip.copy("/compact")
+        with keyboard.pressed(Key.ctrl):
+            keyboard.press('v')
+            keyboard.release('v')
+        keyboard.press(Key.enter)
+        keyboard.release(Key.enter)
+    elif act == "boost":
+        pyperclip.copy("/boost ")
+        with keyboard.pressed(Key.ctrl):
+            keyboard.press('v')
+            keyboard.release('v')
+    elif act in ("proceed", "approve", "enter"):
+        keyboard.press(Key.enter)
+        keyboard.release(Key.enter)
+    elif act in ("cancel", "esc"):
+        keyboard.press(Key.esc)
+        keyboard.release(Key.esc)
+
+    return {"status": "ok", "action": act}
+
+
+def capture_screenshot_bytes() -> bytes:
+    with mss.mss() as sct:
+        monitor = sct.monitors[1]
+        sct_img = sct.grab(monitor)
+        from PIL import Image
+        img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+        img.thumbnail((1280, 720), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=70)
+        return buf.getvalue()
+
+
+agent_runner = AgentRunner(
+    config_getter=lambda: CONFIG,
+    screenshot_fn=capture_screenshot_bytes,
+    desktop_send_fn=inject_prompt_to_desktop,
+    desktop_action_fn=trigger_quick_action,
+    conversations_fn=collect_conversations_summary,
+    config_saver=save_config,
+)
+im_bridge = IMBridgeManager(config_getter=lambda: CONFIG, runner=agent_runner)
+
 
 # ----------------- Routes -----------------
 
@@ -198,7 +407,95 @@ async def get_system_info(token: bool = Depends(verify_token)):
         "hub_url": f"http://{lan_ip}:{port}/?token={AUTH_TOKEN}",
         "official_url": "https://antigravity.google",
         "apk_available": (DIST_DIR / "agy-pocket.apk").exists(),
-        "shortcuts": CONFIG.get("custom_shortcuts", [])
+        "shortcuts": CONFIG.get("custom_shortcuts", []),
+        "im_bridge": im_bridge.status(),
+        "current_model": CONFIG.get("agy_model", ""),
+    }
+
+@app.get("/api/quota")
+async def get_quota(include_cli: bool = Query(False), token: bool = Depends(verify_token)):
+    """Query local Antigravity model quotas, reset countdowns, and prompt credits."""
+    data = await asyncio.to_thread(get_antigravity_quota, include_cli)
+    data["current_model"] = CONFIG.get("agy_model", "")
+    return data
+
+@app.post("/api/model")
+async def select_model(req: ModelSelectRequest, token: bool = Depends(verify_token)):
+    """Switch active/default Antigravity CLI model across sessions."""
+    model_val = "" if req.model.strip().lower() in ("default", "reset", "auto", "系统默认") else req.model.strip()
+    agent_runner.set_default_model(model_val, req.chat_key)
+    return {"status": "ok", "current_model": CONFIG.get("agy_model", "")}
+
+@app.get("/api/im/status")
+async def get_im_status(token: bool = Depends(verify_token)):
+    """Return IM bridge runtime status and sanitized config."""
+    im_cfg = CONFIG.get("im_bridge") or {}
+    tg = im_cfg.get("telegram") or {}
+    fs = im_cfg.get("feishu") or {}
+    qq = im_cfg.get("qq") or {}
+    return {
+        "runtime": im_bridge.status(),
+        "config": {
+            "enabled": bool(im_cfg.get("enabled", False)),
+            "fallback_to_desktop": bool(im_cfg.get("fallback_to_desktop", True)),
+            "workspace_dir": CONFIG.get("workspace_dir", ""),
+            "agy_mode": CONFIG.get("agy_mode", "auto"),
+            "agy_model": CONFIG.get("agy_model", ""),
+            "telegram": {
+                "enabled": bool(tg.get("enabled", False)),
+                "has_token": bool(tg.get("bot_token")),
+                "proxy_url": tg.get("proxy_url", ""),
+                "allowed_user_ids": tg.get("allowed_user_ids", []),
+            },
+            "feishu": {
+                "enabled": bool(fs.get("enabled", False)),
+                "app_id": fs.get("app_id", ""),
+                "has_secret": bool(fs.get("app_secret")),
+                "allowed_open_ids": fs.get("allowed_open_ids", []),
+            },
+            "qq": {
+                "enabled": bool(qq.get("enabled", False)),
+                "ws_url": qq.get("ws_url", ""),
+                "has_token": bool(qq.get("access_token")),
+                "allowed_qq": qq.get("allowed_qq", []),
+            },
+        },
+    }
+
+@app.post("/api/im/config")
+async def update_im_config(req: IMBridgeConfigRequest, token: bool = Depends(verify_token)):
+    """Update IM bridge settings in config.json and reload active workers."""
+    im_cfg = CONFIG.setdefault("im_bridge", {})
+    if req.enabled is not None:
+        im_cfg["enabled"] = req.enabled
+    if req.fallback_to_desktop is not None:
+        im_cfg["fallback_to_desktop"] = req.fallback_to_desktop
+    if req.workspace_dir is not None and req.workspace_dir.strip():
+        CONFIG["workspace_dir"] = req.workspace_dir.strip()
+    if req.agy_mode is not None and req.agy_mode in ("auto", "default", "accept-edits", "plan"):
+        CONFIG["agy_mode"] = req.agy_mode
+    if req.agy_model is not None:
+        agent_runner.set_default_model(req.agy_model)
+
+    for channel in ("telegram", "feishu", "qq"):
+        patch = getattr(req, channel)
+        if isinstance(patch, dict):
+            target = im_cfg.setdefault(channel, {})
+            for k, v in patch.items():
+                target[k] = v
+
+    save_config(CONFIG)
+    im_bridge.reload()
+    return {"status": "ok", "runtime": im_bridge.status()}
+
+@app.post("/api/chat")
+async def chat_with_agent(req: ChatRequest, token: bool = Depends(verify_token)):
+    """Conversational endpoint shared with IM bridge (supports /usage, /status, CLI prompts)."""
+    reply = await asyncio.to_thread(agent_runner.handle_message, req.chat_key, req.text)
+    return {
+        "status": "ok",
+        "text": reply.text,
+        "has_image": reply.image_bytes is not None,
     }
 
 @app.get("/api/qrcode")
@@ -222,53 +519,7 @@ async def generate_qr(text: str = Query(...)):
 @app.get("/api/conversations")
 async def list_conversations(token: bool = Depends(verify_token)):
     """List recent Antigravity conversations and their execution state."""
-    if not DEFAULT_BRAIN_DIR.exists():
-        return {"conversations": []}
-    
-    results = []
-    # Find all conversation folders
-    conv_dirs = [d for d in DEFAULT_BRAIN_DIR.iterdir() if d.is_dir() and not d.name.startswith(".")]
-    # Sort by mtime descending
-    conv_dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
-    
-    for cdir in conv_dirs[:15]:
-        conv_id = cdir.name
-        transcript_path = cdir / ".system_generated" / "logs" / "transcript.jsonl"
-        last_user_msg = ""
-        last_step_status = "UNKNOWN"
-        last_time = cdir.stat().st_mtime
-        
-        if transcript_path.exists():
-            try:
-                with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
-                    lines = [line.strip() for line in f if line.strip()]
-                for line in reversed(lines):
-                    try:
-                        data = json.loads(line)
-                        if not last_user_msg and data.get("type") == "USER_INPUT":
-                            last_user_msg = data.get("content", "")
-                        if last_step_status == "UNKNOWN" and "status" in data:
-                            last_step_status = data.get("status")
-                        if last_user_msg and last_step_status != "UNKNOWN":
-                            break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-        
-        # Check for artifacts (.md files)
-        artifacts = [f.name for f in cdir.glob("*.md")]
-        
-        results.append({
-            "id": conv_id,
-            "title": (last_user_msg[:60] + "...") if len(last_user_msg) > 60 else (last_user_msg or conv_id),
-            "status": last_step_status,
-            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_time)),
-            "artifact_count": len(artifacts),
-            "artifacts": artifacts
-        })
-        
-    return {"conversations": results}
+    return {"conversations": collect_conversations_summary()}
 
 @app.get("/api/conversations/{conv_id}")
 async def get_conversation_detail(conv_id: str, token: bool = Depends(verify_token)):
@@ -320,83 +571,32 @@ async def get_conversation_detail(conv_id: str, token: bool = Depends(verify_tok
 @app.post("/api/send_prompt")
 async def send_prompt(req: PromptRequest, token: bool = Depends(verify_token)):
     """Focus Antigravity and inject prompt text."""
-    find_and_focus_antigravity_window()
-    time.sleep(0.15)
-    
-    # Copy text to clipboard and simulate Ctrl+V
-    pyperclip.copy(req.text)
-    
-    with keyboard.pressed(Key.ctrl):
-        keyboard.press('v')
-        keyboard.release('v')
-        
-    if req.auto_submit:
-        time.sleep(0.1)
-        keyboard.press(Key.enter)
-        keyboard.release(Key.enter)
-        
-    return {"status": "success", "sent": req.text}
+    try:
+        return inject_prompt_to_desktop(req.text, req.auto_submit)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/quick_action")
 async def quick_action(req: QuickActionRequest, token: bool = Depends(verify_token)):
     """Trigger predefined quick action (slash commands, approve, keep-awake, etc.)."""
-    action = req.action.lower()
-    
-    if action == "keep_awake":
-        enabled = req.param.lower() in ("true", "1") if req.param else True
-        success = set_keep_awake(enabled)
-        return {"status": "ok", "keep_awake": enabled, "success": success}
-        
-    find_and_focus_antigravity_window()
-    time.sleep(0.1)
-    
-    if action == "plan":
-        pyperclip.copy("/plan ")
-        with keyboard.pressed(Key.ctrl):
-            keyboard.press('v')
-            keyboard.release('v')
-    elif action == "goal":
-        pyperclip.copy("/goal ")
-        with keyboard.pressed(Key.ctrl):
-            keyboard.press('v')
-            keyboard.release('v')
-    elif action == "compact":
-        pyperclip.copy("/compact")
-        with keyboard.pressed(Key.ctrl):
-            keyboard.press('v')
-            keyboard.release('v')
-        keyboard.press(Key.enter)
-        keyboard.release(Key.enter)
-    elif action in ("proceed", "approve", "enter"):
-        keyboard.press(Key.enter)
-        keyboard.release(Key.enter)
-    elif action in ("cancel", "esc"):
-        keyboard.press(Key.esc)
-        keyboard.release(Key.esc)
-        
-    return {"status": "ok", "action": action}
+    try:
+        return trigger_quick_action(req.action, req.param)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/screen/shot.jpg")
 async def get_screen_shot(token: bool = Depends(verify_token)):
     """Capture screen frame and return JPEG."""
     try:
-        with mss.mss() as sct:
-            monitor = sct.monitors[1]  # Primary monitor
-            sct_img = sct.grab(monitor)
-            from PIL import Image
-            img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
-            # Downsample slightly for faster mobile streaming
-            img.thumbnail((1280, 720), Image.Resampling.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=70)
-            buf.seek(0)
-            return Response(content=buf.getvalue(), media_type="image/jpeg")
+        return Response(content=capture_screenshot_bytes(), media_type="image/jpeg")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/screen/tap")
 async def tap_screen(req: TapRequest, token: bool = Depends(verify_token)):
     """Map normalized touch point (0.0 - 1.0) to screen pixel and click."""
+    if not mouse or not MouseButton:
+        raise HTTPException(status_code=500, detail="Desktop mouse controller is unavailable.")
     try:
         with mss.mss() as sct:
             mon = sct.monitors[1]
@@ -442,5 +642,8 @@ if __name__ == "__main__":
     if CONFIG.get("keep_awake", True):
         set_keep_awake(True)
         print("💡 Keep-Awake enabled (preventing PC sleep)")
+
+    im_bridge.start()
+    print(f"🤖 IM Bridge status: {im_bridge.status()}")
         
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

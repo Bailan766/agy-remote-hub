@@ -370,6 +370,62 @@
       z-index: 100;
       box-shadow: 0 4px 16px rgba(0,0,0,0.5);
     }
+
+    /* Quota & IM Status */
+    .quota-row {
+      padding: 10px 0;
+      border-bottom: 1px solid #252a3a;
+    }
+    .quota-row:last-child {
+      border-bottom: none;
+    }
+    .quota-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.85rem;
+      margin-bottom: 6px;
+    }
+    .quota-bar-bg {
+      height: 8px;
+      background: #11141c;
+      border-radius: 99px;
+      overflow: hidden;
+    }
+    .quota-bar-fill {
+      height: 100%;
+      border-radius: 99px;
+      transition: width 0.3s ease;
+    }
+    .quota-sub {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+    .im-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 10px;
+      border-radius: 8px;
+      background: #202433;
+      border: 1px solid #2e3549;
+      font-size: 0.78rem;
+    }
+    .chat-box {
+      background: #11141c;
+      border: 1px solid #2a3042;
+      border-radius: 10px;
+      padding: 10px;
+      font-size: 0.82rem;
+      line-height: 1.5;
+      max-height: 220px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
   </style>
 </head>
 <body>
@@ -464,6 +520,47 @@
         </div>
       </div>
     </div>
+
+    <!-- View 4: Model Quota & IM Bridge -->
+    <div id="view-quota" class="tab-view">
+      <div class="card">
+        <div class="card-title">
+          <span>📊 模型用量与切换</span>
+          <div style="display:flex; gap:6px;">
+            <button class="btn-sm" onclick="selectModel('default')">默认模型</button>
+            <button class="btn-sm" onclick="loadQuota()">刷新</button>
+          </div>
+        </div>
+        <div id="current-model-pill" style="font-size:0.78rem; color: var(--accent); margin-bottom:6px;">
+          当前对话模型: 系统默认
+        </div>
+        <div id="quota-summary" style="font-size:0.78rem; color: var(--text-muted); margin-bottom:8px;">
+          点击刷新获取本地 Antigravity 模型配额...
+        </div>
+        <div id="quota-list"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          <span>🤖 IM 机器人桥接状态</span>
+          <button class="btn-sm" onclick="loadIMStatus()">刷新</button>
+        </div>
+        <div id="im-status-list" style="display:flex; flex-wrap:wrap; gap:8px;">
+          <span class="im-pill">加载中...</span>
+        </div>
+      </div>
+
+      <div class="card" style="flex:1; display:flex; flex-direction:column; gap:8px;">
+        <div class="card-title" style="margin-bottom:2px;">
+          <span>💬 类 OpenClaw 对话执行测试</span>
+        </div>
+        <div style="display:flex; gap:6px;">
+          <input type="text" id="chat-input" placeholder="输入 /usage、/status 或直接对话..." style="flex:1; background:#131620; border:1px solid #2e3549; color:var(--text-main); padding:8px 12px; border-radius:10px; font-size:0.85rem;" onkeydown="if(event.key==='Enter') sendChatCommand()" />
+          <button class="btn-sm" style="background:var(--primary); color:white; padding:8px 14px;" onclick="sendChatCommand()">发送</button>
+        </div>
+        <div id="chat-output" class="chat-box" style="flex:1;">发送 /help 查看全部对话指令。</div>
+      </div>
+    </div>
   </main>
 
   <!-- Bottom Prompt Dock -->
@@ -496,6 +593,10 @@
       <svg viewBox="0 0 24 24"><path d="M20 3H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h4v2h8v-2h4c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 14H4V5h16v12z"/></svg>
       <span>实景画面</span>
     </button>
+    <button class="nav-btn" onclick="switchTab('quota', this)">
+      <svg viewBox="0 0 24 24"><path d="M5 9.2h3V19H5V9.2zM10.6 5h2.8v14h-2.8V5zm5.6 8H19v6h-2.8v-6z"/></svg>
+      <span>用量与Bot</span>
+    </button>
   </nav>
 
   <script>
@@ -524,6 +625,10 @@
       } else if (tabId === 'screen') {
         document.getElementById('view-screen').classList.add('active');
         refreshScreen();
+      } else if (tabId === 'quota') {
+        document.getElementById('view-quota').classList.add('active');
+        loadQuota();
+        loadIMStatus();
       }
       if (el) el.classList.add('active');
     }
@@ -697,6 +802,125 @@
         setTimeout(refreshScreen, 300);
       } catch (e) {
         showToast('点击触发失败');
+      }
+    }
+
+    async function selectModel(modelId) {
+      try {
+        const resp = await apiFetch('/api/model', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: modelId })
+        });
+        const data = await resp.json();
+        const cur = data.current_model || '系统默认';
+        document.getElementById('current-model-pill').innerText = `当前对话模型: ${cur}`;
+        showToast('已切换模型: ' + cur);
+        loadQuota();
+      } catch (e) {
+        showToast('切换模型失败');
+      }
+    }
+
+    // Quota, IM Status & Conversational Chat
+    async function loadQuota() {
+      const sumEl = document.getElementById('quota-summary');
+      const listEl = document.getElementById('quota-list');
+      const curEl = document.getElementById('current-model-pill');
+      sumEl.innerText = '正在检测本地 Antigravity 模型配额...';
+      try {
+        const resp = await apiFetch('/api/quota');
+        const data = await resp.json();
+        listEl.innerHTML = '';
+
+        const activeModel = data.current_model || '';
+        curEl.innerText = `当前对话模型: ${activeModel || '系统默认'}`;
+
+        if (!data.available) {
+          sumEl.innerText = data.error || '未检测到运行中的 Antigravity 本地服务';
+          return;
+        }
+
+        const meta = [data.plan, data.email].filter(Boolean).join(' · ');
+        const credits = data.credits && data.credits.available_prompt != null
+          ? ` | Credits: ${data.credits.available_prompt}` + (data.credits.monthly_prompt != null ? ` / ${data.credits.monthly_prompt}` : '')
+          : '';
+        sumEl.innerText = (meta ? `账户: ${meta}` : '已连接') + credits + ` (更新: ${data.checked_at})`;
+
+        const models = data.models || [];
+        if (models.length === 0) {
+          listEl.innerHTML = '<div style="color:var(--text-muted); font-size:0.8rem;">暂无模型配额数据</div>';
+          return;
+        }
+
+        models.forEach(m => {
+          const pct = m.remaining_pct;
+          const color = pct >= 50 ? '#00d2aa' : (pct >= 20 ? '#f59e0b' : '#ef4444');
+          const isCurrent = activeModel && (activeModel === m.model_id || activeModel === m.label);
+          const row = document.createElement('div');
+          row.className = 'quota-row';
+          row.innerHTML = `
+            <div class="quota-meta">
+              <strong>${m.label}${isCurrent ? ' ✅' : ''}</strong>
+              <div style="display:flex; align-items:center; gap:8px;">
+                <span style="color:${color}; font-weight:700;">剩余 ${pct}%</span>
+                <button class="btn-sm" style="padding:3px 8px; font-size:0.72rem; background:${isCurrent ? '#00d2aa' : '#32384c'}; color:${isCurrent ? '#0f1117' : '#f0f3f8'};" onclick="selectModel('${m.model_id.replace(/'/g, "\\'")}')">${isCurrent ? '当前使用' : '切换'}</button>
+              </div>
+            </div>
+            <div class="quota-bar-bg">
+              <div class="quota-bar-fill" style="width:${pct}%; background:${color};"></div>
+            </div>
+            <div class="quota-sub">
+              <span>${m.model_id}</span>
+              <span>重置倒计时: ${m.reset_countdown}</span>
+            </div>
+          `;
+          listEl.appendChild(row);
+        });
+      } catch (e) {
+        sumEl.innerText = '加载模型用量失败';
+      }
+    }
+
+    async function loadIMStatus() {
+      const el = document.getElementById('im-status-list');
+      try {
+        const resp = await apiFetch('/api/im/status');
+        const data = await resp.json();
+        const rt = data.runtime || {};
+        const items = [
+          { name: 'Telegram', info: rt.telegram || {} },
+          { name: '飞书', info: rt.feishu || {} },
+          { name: 'QQ (OneBot)', info: rt.qq || {} }
+        ];
+        el.innerHTML = items.map(it => {
+          const state = it.info.state || 'stopped';
+          const color = state === 'running' ? '#00d2aa' : (state === 'error' ? '#ef4444' : '#959ea9');
+          const err = it.info.error ? ` (${it.info.error})` : '';
+          return `<span class="im-pill"><span style="color:${color};">●</span> ${it.name}: ${state}${err}</span>`;
+        }).join('');
+      } catch (e) {
+        el.innerHTML = '<span class="im-pill">状态获取失败</span>';
+      }
+    }
+
+    async function sendChatCommand() {
+      const input = document.getElementById('chat-input');
+      const out = document.getElementById('chat-output');
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = '';
+      out.innerText = `> ${text}\n\n⏳ 正在执行...`;
+      try {
+        const resp = await apiFetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text })
+        });
+        const data = await resp.json();
+        out.innerText = `> ${text}\n\n${data.text || '(无输出)'}`;
+      } catch (e) {
+        out.innerText = `❌ 请求失败: ${e}`;
       }
     }
 
